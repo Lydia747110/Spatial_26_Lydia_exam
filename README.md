@@ -6,6 +6,6 @@ The folder "Scripts" contains 1 R file and 2 STAN files. The STAN files contain 
 
 The folder "Raw data" contains the raw data files necessary to generate all results. (Also BBR?)
 
-The folder "Posterior draws" contains the draws from the model posteriors used for further analysis. It also contains the full model fits
+The folder "small_posterior draws" contains 300 draws from the model posteriors used for further analysis. Note that the results in the paper are based on 2000 draws for better accuracy, but these files were much to big to be uploaded
 
 Note that the R script generates results but doesn't save them, as they are quick to run. If you decide to fit the models yourself, I advise saving the fits as rds files using writeRDS(). as they are time consuming to fit. 

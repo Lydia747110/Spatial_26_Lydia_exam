@@ -4,7 +4,7 @@ Repository for spatial analytics f26
 ## Structure of repository
 The folder "Scripts" contains 1 R file and 2 STAN files. The STAN files contain the code for the statistical models, and are loaded by R. All analysis was run from the R file.
 
-The folder "Raw data" contains the raw data files necessary to generate all results. (Also BBR?)
+The folder "Raw_data" contains the raw data files necessary to generate all results.
 
 The folder "small_posterior draws" contains 300 draws from the model posteriors used for further analysis. Note that the results in the paper are based on 2000 draws for better accuracy, but these files were much to big to be uploaded
 

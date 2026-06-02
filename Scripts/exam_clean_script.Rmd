@@ -19,7 +19,7 @@ library(purrr)
 #statistical analysis
 library(EnvStats)
 library(cmdstanr)
-#rethinking? if I want to make HPDI() using that function, then yes
+library(rethinking)
 ```
 
 If you need to install cmdstanr, use this, as it is not on CRAN:
@@ -34,7 +34,7 @@ install_cmdstan()
 ## load polygons and wrangle
 from https://data-science.dk/datasat/gis/valg/valgsteder/afstemningsomraader-2026-fv26-download-de-danske-valgsteder/
 ```{r}
-data <- read_sf("../Raw_data/5ef99ab13ed91a872876ffda99b0d0914f9d7d77b31c180a7f68798b5ade5df4/utm32n_shp/fv2026.shp")
+data <- read_sf("../Raw_data/fv2026.shp")
 
 #check if it looks right
 #plot(st_geometry(data))
@@ -392,10 +392,10 @@ If you ran the models yourself:
 p_partes <- votes_fit$draws("p")
 p_max <- lost_votes_fit$draws("p_max")
 p_true <- lost_votes_fit$draws("p_true")
-idx_used <- 1:1312
+idx_used <- 1:1312 #change as needed
 subset_data <- data_utm[idx_used,]
 N_regions_used <- 1312
-N_samples <- 2000
+N_samples <- 2000 #adjust as needed: should be iter_sampling *chains
 ```
 
 to read files from git:

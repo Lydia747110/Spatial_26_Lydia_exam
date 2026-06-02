@@ -12,4 +12,5 @@ The folder "small_posterior draws" contains 300 draws from the model posteriors 
 
 Note that the R script generates results but doesn't save them, as they are quick to run. If you decide to fit the models yourself, I advise saving the fits as rds files using writeRDS(). as they are time consuming to fit. 
 
-Indeholder data fra Styrelsen for Dataforsyning og Infrastruktur, Danmarks Administrative Geografiske Inddelinger , Maj 2026”
+
+Indeholder data fra Styrelsen for Dataforsyning og Infrastruktur, Danmarks Administrative Geografiske Inddelinger , Maj 2026

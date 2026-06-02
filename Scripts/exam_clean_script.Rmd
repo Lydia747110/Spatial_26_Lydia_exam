@@ -1,0 +1,521 @@
+
+```{r}
+#read libraries
+##general data handling
+library(tidyverse)
+library(dplyr)
+library(reticulate)
+library(stringr)
+#spatial wrangling and plotting
+library(leaflet)
+library(sf)
+library(mapview)
+library(tmap)
+#data reading/processing
+library(readxl)
+library(jsonlite)
+library(purrr)
+
+#statistical analysis
+library(EnvStats)
+library(cmdstanr)
+#rethinking? if I want to make HPDI() using that function, then yes
+```
+
+If you need to install cmdstanr, use this, as it is not on CRAN:
+```{r}
+install.packages("cmdstanr", repos = c("https://mc-stan.org/r-packages/", getOption("repos"))) 
+library(cmdstanr)
+install_cmdstan()
+```
+
+#Section 1: Voting Areas
+
+## load polygons and wrangle
+from https://data-science.dk/datasat/gis/valg/valgsteder/afstemningsomraader-2026-fv26-download-de-danske-valgsteder/
+```{r}
+data <- read_sf("../Raw_data/5ef99ab13ed91a872876ffda99b0d0914f9d7d77b31c180a7f68798b5ade5df4/utm32n_shp/fv2026.shp")
+
+#check if it looks right
+#plot(st_geometry(data))
+
+#check crs and rename to keep track of it
+st_crs(data) 
+data_utm <- data
+
+#make unique names by combining colloqiual name and voting area index
+data_utm$full_name <- paste0(data_utm$navn, ";",data_utm$opstilling)
+
+#sort by this name
+data_utm <- data_utm[order(data_utm$full_name),]
+
+#as we will later see, these two have the exact same polling station locations, so we will merge their polygons
+which(data_utm$navn %in% c("Gymnasiet 2","Gymnasiet 1"))
+data_utm[385,]$geometry <- st_union(data_utm[c(385,386),])
+data_utm <- data_utm[c(-386),]
+
+#also remove Christiansø, due to mismatch with BBR in section 4
+data_utm <- data_utm[c(-which(data_utm$navn == "Christiansø")),]
+```
+
+#Section 2: Polling station locations
+
+```{r}
+data <- fromJSON("https://api.dataforsyningen.dk/afstemningsomraader", simplifyVector = FALSE)
+
+polling_points <- map_dfr(data, function(x) {
+  tibble(
+    navn = x$navn,
+    lng = x$afstemningssted$adgangsadresse$koordinater[[1]],
+    lat = x$afstemningssted$adgangsadresse$koordinater[[2]],
+    opstilling = x$opstillingskreds$nummer
+  )
+})
+
+
+polling_points %>% select(c("lng","lat")) %>% head() #looks like wgs84
+
+polling_points_wgs <- st_as_sf(polling_points, coords = c("lng", "lat"), crs = 4326)
+polling_points_utm <- st_transform(polling_points_wgs, 25832)
+
+#make unique names by combining colloqiual name and area index
+polling_points_utm$full_name <- paste0(polling_points_utm$navn, ";", polling_points_utm$opstilling)
+
+#sort
+polling_points_utm <- polling_points_utm[order(polling_points_utm$full_name),]
+
+
+polling_points_utm[polling_points_utm$navn %in% c("Gymnasiet 2","Gymnasiet 1"),]$geometry #xmin and xmax of bounding boxx are equal, same for y, so these points have same location (to this level of precision).
+
+#remove one of them, and Christiansø
+polling_points_utm <- polling_points_utm[c(-which(polling_points_utm$navn %in% c("Gymnasiet 2", "Christiansø"))),]
+```
+
+Check that polling points align with voting regions
+```{r}
+has_own_point <- c()
+for (i in 1:nrow(data_utm)){
+  has_own_point <- c(has_own_point, lengths(st_intersects(data_utm$geometry[order(data_utm$full_name)][i], polling_points_utm[order(polling_points_utm$full_name)[i],])))
+}
+
+sum(has_own_point==1) #almost all polling stations lie within corresponding voting area
+
+#look at those that don't
+mapview(data_utm[order(data_utm$full_name),][has_own_point==0,], col.regions = "red") + 
+  mapview(polling_points_utm[order(polling_points_utm$full_name),][has_own_point==0,])
+#nothing to worry about, looks realistic
+```
+
+## Make matrix with distances between stations
+```{r}
+#make the matrix
+distance_matrix <- st_distance(polling_points_utm, polling_points_utm)
+
+#take a look - unit is meter
+distance_matrix[c(1:5, 100:105),1:5]
+
+#save as numeric values for easier computation
+numeric_distance_matrix <- drop_units(distance_matrix)
+numeric_distance_matrix <- numeric_distance_matrix/1000 #use km as units
+```
+
+#Section 3: Distribution of votes for each party and voter tournout for each voting place
+From https://www.statistikbanken.dk/20005
+```{r}
+total_voting <- read_excel("../Raw_data/stor2026426145511622605080FV26TOTA.xlsx")
+
+voters_data <- rep(0,1420) #make column to bind to
+for (i in 0:15){
+  relevant_votes <- total_voting[(3 + 1420*i):(2 + 1420*(i+1)),3]
+  relevant_votes$...3 <- as.numeric(relevant_votes$...3)
+  colnames(relevant_votes) <- total_voting[3 + 1420*i,1]
+  voters_data <- cbind(voters_data, relevant_votes)
+}
+voters_data <- voters_data[,c(-1)]
+voters_data$Område <- as.vector(total_voting[3:1422,2])[[1]]
+
+colnames(voters_data)[c(1,15,16)] <-c("GYLDIGE_STEMMER_I_ALT", "UGYLDIGE_STEMMER_I_ALT", "ANTAL_VÆLGERE")
+
+#get total count of votes
+voters_data$Stemmer_I_Alt <- voters_data$GYLDIGE_STEMMER_I_ALT + voters_data$UGYLDIGE_STEMMER_I_ALT
+
+#sanity check: sum of votes for parties and individuals equals sum of valid votes
+sum(apply(voters_data[,c(2:14)],1,sum) - voters_data$GYLDIGE_STEMMER_I_ALT != 0)
+
+#make "Område" the first column
+voters_data <- voters_data %>% select(c(17,15, 1:14,16,18))
+
+dim(total_voting)
+```
+### Correct voters_data
+fix discrepancy between names in data_utm and voters_data:
+all the ones with "og" have upper case "O" in data_utm but lowercase in voters_data.
+```{r}
+#Correct the names in voters_data
+voters_data[voters_data[,1] == "Hedensted, St.Dalby og Urlev",1] <- "Hedensted, St.Dalby Og Urlev"
+
+voters_data[voters_data[,1] == "Daugård og Ørum Sogne",1] <- "Daugård Og Ørum Sogne"
+
+voters_data[voters_data[,1] == "Langå, Svindinge og Øksendrup",1] <- "Langå, Svindinge Og Øksendrup"
+voters_data[voters_data[,1] == "Ølsted og Eriknauer-Området",1] <- "Ølsted Og Eriknauer-Området"
+voters_data[voters_data[,1] == "Ellested og Herrested",1] <- "Ellested Og Herrested"
+voters_data[voters_data[,1] == "Kullerup og Refsvindinge",1] <- "Kullerup Og Refsvindinge"
+voters_data[voters_data[,1] == "Frørup og Tårup",1] <- "Frørup Og Tårup"
+
+sum(!(data_utm$navn %in% voters_data[,1])) #none missing
+```
+
+Remove rows of voters_data that do not correspond to individual polling stations
+```{r}
+#first combine "Gymnasiet" 1 and 2, remove 2, and remove Christiansø
+voters_data[voters_data$Område == "Gymnasiet 1",2:18] <- voters_data[voters_data$Område == "Gymnasiet 1",2:18] + voters_data[voters_data$Område == "Gymnasiet 2",2:18]
+voters_data <- voters_data[c(-which(voters_data$Område == "Gymnasiet 2")),]
+voters_data <- voters_data[c(-which(voters_data$Område == "Christiansø")),]
+
+not_in_navn <- which(!(voters_data[,1] %in% data_utm$navn))
+length(not_in_navn)
+#106 left: these are overall area names, that do not correspond to individual polling stations: 1 "HELE LANDET" + 10 storkrede + 3 regioner + 92 opstillingskredse
+#voters_data[not_in_navn,1] #check that names match the above description
+
+#filter away
+voters_voting_places_only <- which((voters_data[,1] %in% data_utm$navn))
+reduced_voters <- voters_data[voters_voting_places_only,]
+
+#make full_name for reduced_voters to have corresponding names
+##reduced_voters data came ordered by opstillingskreds, and can be added like so:
+reduced_voters$opstilling <- data_utm$opstilling[order(as.numeric(data_utm$opstilling))]
+
+reduced_voters$full_name <- paste0(reduced_voters$Område, ";", reduced_voters$opstilling)
+
+reduced_voters <- reduced_voters[order(reduced_voters$full_name),]
+```
+
+#Section 4: load BBR data
+The file versions loaded when this analysis was first run may have expired, so you may need to use the below url (add you api key) to check
+available file versions:
+
+https://api.datafordeler.dk/FileDownloads/v2.0/GetAvailableFileDownloads?Register=BBR&apiKey=[api_key]
+
+look/search for a filename of:
+BBR_V3_Bygning_[4-digitmunicipality code]_TotalDownload_csv_Current_[version_number]
+to find the newest version number available
+
+## find distance from building in voting area to relevant polling station
+
+### first a proof of concept to check that the approximation works
+```{r}
+#check that estimation works for finding mean p. It does.
+b <- 4 #arbitrary value
+estimates <- c()
+errors <- c()
+for (i in 1:1000){
+  values <- rgamma(400, shape = 3, scale = 200) 
+  est <- egamma(values, method = "mle")
+  estimates <- rbind(estimates, est$parameters)
+  
+  true_mean <- mean(exp(-b*values))
+  est_mean <- (1+est$parameters[2]*b)^(-est$parameters[1])
+  error_mean <- true_mean-est_mean
+  errors <- c(errors, error_mean)
+} 
+
+plot(estimates) #estimates of distribution shape are somewhat imprecise
+hist(errors) #but errors are tiny, so its not a problem
+quantile(errors)
+```
+
+### Now do the real thing
+This loops through each municipality, loads all buildings from BBR in that municipality, extracts only buildings that people live in (from https://bbr.dk/kodelister):
+
+Kode: 110 - Stuehus til landbrugsejendom
+Kode: 120 - Fritliggende enfamiliehus
+Kode: 121 - Sammenbygget enfamiliehus
+Kode: 122 - Fritliggende enfamiliehus i tæt-lav bebyggelse
+Kode: 130 - (UDFASES) Række-, kæde-, eller dobbelthus (lodret adskillelse mellem enhederne)
+Kode: 131 - Række-, kæde- og klyngehus
+Kode: 132 - Dobbelthus
+Kode: 140 - Etagebolig-bygning, flerfamiliehus eller to-familiehus
+Kode: 150 - Kollegium
+Kode: 160 - Boligbygning til døgninstitution
+Kode: 190 - Anden bygning til helårsbeboelse
+
+...and extracts their coordinates. It then loops through all voting areas in that municipality, extracts residencies in that area, estimates the distributional parameters of the distances to the relevant polling station.
+
+```{r}
+#check that indices align
+sum(data_utm$full_name != polling_points_utm$full_name)
+
+api_key <- "write_key_here"
+
+#make new columns to save distribution parameters
+data_utm$k_estimates <- NA
+data_utm$theta_estimates <- NA
+
+outdir  <- tempdir()
+
+kommunekoder <- unique(data_utm$kommunekod)
+
+for(kommune in kommunekoder){
+  
+  # fetch zip file with data
+  url <- paste0(
+  "https://api.datafordeler.dk/FileDownloads/v1.0/GetFile?Filename=BBR_V3_Bygning_",kommune,"_TotalDownload_csv_Current_633.zip&apikey=",api_key
+  )
+  #read csv file in zip
+  zipfile <- tempfile(fileext = ".zip")
+  download.file(url, zipfile, mode = "wb")
+  files <- unzip(zipfile, exdir = tempdir())
+  temp_data <- read.csv(files[1])
+
+  #filter to only get buildings that people live in
+  bolig_data <- temp_data[temp_data$byg021BygningensAnvendelse %>% as.numeric() %in% c(110,120,121,122,130,131,132,140,150,160, 190),]
+
+  #extract coordinates from data
+  byg_lat <- c()
+  byg_long <- c()
+  strings <- bolig_data$byg404Koordinat %>% strsplit(" ")
+  for (i in 1:length(strings)){
+    byg_long[i] <- strings[[i]][2] %>% str_extract("\\d+\\.*\\d*")
+    byg_lat[i] <- strings[[i]][3] %>% str_extract("\\d+\\.*\\d*")
+  }
+
+  #Convert to points
+  byg_points_sf  <- st_as_sf(data.frame("long" = byg_long, "lat" = byg_lat), coords = c("long", "lat"), crs = 25832)
+  byg_points_sf_saved <- byg_points_sf
+  
+  #go through each area to calculate distances
+  
+  for (area in which(data_utm$kommunekod == kommune)){
+    
+    inside <- st_within(
+    byg_points_sf,
+    data_utm[area,],
+    sparse = FALSE
+  )[,1]
+    
+    relevant_points <- byg_points_sf[inside,]
+    
+    #remove from list of buildings for future areas for faster search
+    byg_points_sf <- byg_points_sf[!inside,]
+    # define target
+    polling_station <- polling_points_utm[area,]
+    #save mean log distance for each area
+    distances <- st_distance(polling_station, relevant_points) %>% drop_units() #drop meter unit. 
+    estimates <- egamma(distances[1,], method = "mle")
+    k_est <- estimates$parameters[1]
+    theta_est <- estimates$parameters[2]
+    
+    data_utm$k_estimates[area] <- k_est
+    data_utm$theta_estimates[area] <- theta_est
+  }
+}
+
+#check if any data is missing
+sum(is.na(data_utm$k_estimates))
+sum(is.na(data_utm$theta_estimates))
+
+hist(data_utm$k_estimates*data_utm$theta_estimates/1000, main = "Estimated mean distance to polling station for each area", xlab = "Distance (km)")
+```
+
+#Section 5: run stan models
+## Prepare data
+```{r}
+n_voters <- reduced_voters$ANTAL_VÆLGERE
+
+V <- reduced_voters$Stemmer_I_Alt
+
+votes <- reduced_voters[,c(2,4:16)]
+votes <- votes %>% as.matrix()
+
+#make a prior for distribution of votes by using the national average
+votes_share_pr_party <- apply(votes,2,mean)/sum(apply(votes,2,mean))
+alpha_prior_mu <- log(vote_share_pr_party[1:13]/vote_share_pr_party[14])
+
+votes_data_list <- list(
+  N_regions = nrow(data_utm),
+  N_parties = ncol(votes),
+  votes = votes,
+  Dmat = numeric_distance_matrix,
+  alpha_mu = alpha_prior_mu
+)
+
+
+
+lost_votes_data_list <- list(
+  V = V,
+  n_voters = n_voters,
+  k = data_utm$k_estimates,
+  theta = data_utm$theta_estimates/1000, #adjust distances to be in km rather than m
+  N_regions = nrow(data_utm),
+  D = numeric_distance_matrix
+)
+```
+
+## run models
+This is very computationally heavy - consider running smaller version, or download the fitted values from the github repository
+###votes_model
+```{r}
+#compile model and fit
+votes_model <- cmdstan_model("votes_gp_1.stan")
+
+votes_fit <- votes_model$sample(
+  data = votes_data_list,
+  chains = 10,
+  parallel_chains = 10,
+  iter_warmup = 400,
+  iter_sampling = 200,
+  adapt_delta = 0.90
+)
+```
+
+###lost_votes_model
+```{r}
+lost_votes_model <- cmdstan_model("lost_votes.stan")
+
+lost_votes_fit <- lost_votes_model$sample(
+  data = lost_votes_data_list,
+  chains = 20,
+  parallel_chains = 20,
+  iter_warmup = 400,
+  iter_sampling = 100,
+  adapt_delta = 0.90
+)
+```
+
+
+#Section 6: analysing posterior draws
+
+This section uses the posterior samples to simulate the outcome of a counterfactual election with 0 distance to polling stations for all voters, compared to simulated election with distances as they are today.
+
+If you ran the models yourself:
+```{r}
+p_partes <- votes_fit$draws("p")
+p_max <- lost_votes_fit$draws("p_max")
+p_true <- lost_votes_fit$draws("p_true")
+idx_used <- 1:1312
+subset_data <- data_utm[idx_used,]
+N_regions_used <- 1312
+N_samples <- 2000
+```
+
+to read files from git:
+```{r}
+p_parties <- readRDS("../small_posterior_draws/p_parties_small.rds")
+p_max <- readRDS("../small_posterior_draws/p_max_small.rds")
+p_true <- readRDS("../small_posterior_draws/p_true_small.rds")
+idx_used <- readRDS("../small_posterior_draws/idx_656_seed_123.rds")
+subset_data <- data_utm[idx_used,]
+
+N_regions_used <- 656
+N_samples <- 300
+```
+
+Reshape p_max and p_true:
+```{r}
+#reshape arrays
+max_proportions <- array_reshape(p_max, c(N_samples,N_regions_used), order="C")
+true_proportions <- array_reshape(p_true, c(N_samples,N_regions_used), order="C")
+#get contrast: how much higher would voter turnout be in each area 
+contrast_proportions <- max_proportions-true_proportions
+```
+
+plot of proportion of voters lost:
+```{r}
+100*contrast_proportions %>% apply(2,HPDI,0.95) %>% range()#densest 95% credible interval posits that voter turnout in different areas would increase by at least 0.03 percentage points, and at most 12.76 percentage points
+
+100*max(apply(contrast_proportions,2,mean)) #the highest posterior mean estimate of the difference in turnout for any area is 7.62 percentage points.
+
+#Calculate the percentage point difference in voter turnout for all of denmark
+extra_voters <- (contrast_proportions %*% diag(n_voters[idx_used])) %>% apply(1,sum)
+
+100*(extra_voters/sum(n_voters[idx_used])) %>% HPDI(0.95) #95% credible interval from 0.76 to 1.81 percentage points. 
+
+
+#make plot
+subset_data$contrast_proportions_mu <- apply(contrast_proportions,2,mean)*100 #convert to percentage points
+
+my_breaks <- c(0,1,2,4,8)
+
+my_col <- rgb((my_breaks - my_breaks[1])/max(my_breaks - my_breaks[1]),1-(my_breaks - my_breaks[1])/max(my_breaks - my_breaks[1]),0)
+
+tm_shape(subset_data) +
+  tm_polygons(
+    col = "contrast_proportions_mu",
+    palette = my_col,
+    breaks = my_breaks,
+    title = "Percentage Point \nDifference in Turnout"
+  ) +
+  tm_layout(
+    legend.outside = TRUE
+  )
+```
+
+correct shape of p_parties array:
+```{r}
+p_party_re <- array_reshape(p_parties, c(N_samples,(N_regions_used*14)), order="C")
+party_probabilities <- array_reshape(p_party_re, c(N_samples,N_regions_used, 14), order="F")
+```
+
+### Bias in outcome?
+```{r}
+sim_votes_true <- c()
+for (draw in 1:2000){
+  this_draw <- c()
+  for (area in 1:N_regions_used){
+    this_area <- rmultinom(1,n_voters[idx_used][area] * true_proportions[draw,area],party_probabilities[draw,area,])
+    this_draw <- rbind(this_draw, t(this_area))
+  }
+  this_draw_flatten <- apply(this_draw,2,sum)/sum(this_draw)
+  sim_votes_true <- rbind(sim_votes_true, this_draw_flatten)
+}
+
+sim_votes_max <- c()
+for (draw in 1:N_samples){
+  this_draw <- c()
+  for (area in 1:N_regions_used){
+    this_area <- rmultinom(1,n_voters[idx_used][area] * true_proportions[draw,area],party_probabilities[draw,area,])
+    this_draw <- rbind(this_draw, t(this_area))
+  }
+  this_draw_flatten <- apply(this_draw,2,sum)/sum(this_draw)
+  sim_votes_max <- rbind(sim_votes_max, this_draw_flatten)
+}
+
+sim_votes_diff <- sim_votes_max - sim_votes_true
+
+
+plot("n", 
+     main = "Estimated differnce in share of votes for each party\n(No distance condition - true distance condition)", 
+     ylim = c(-0.5,0.5),
+     xlim = c(1,14),
+     xlab ="Party",
+     ylab = "Percentage point difference",
+     xaxt="n")
+axis(side=1, at=1:14, labels = c("NA","A","B", "C", "F", "H", "I", "M", "O", "V", "Æ", "Ø", "Å", "U"))
+for (i in 1:30){
+  lines(100*sim_votes_diff[i,])
+}
+lines(c(1,14),c(0,0),lty=2, col="red")
+reduced_voters %>% colnames()
+credible_intervals <- 100*apply(sim_votes_diff,2,HPDI,0.95)
+max(credible_intervals[2,]) #very certain that no party would have gotten 0.08 percentage points more of vote share
+min(credible_intervals[1,]) #or lost more than 0.1 perentage points.
+```
+No clear bias, and all simulations agree that any difference is certainly smaller than 1 percentage point.
+
+### blue vs red block
+```{r}
+blue_parties <- c(4,6,7,9,10,11)
+red_parties <-  c(2,3,5,12,13)
+
+plot("n", xlim=c(0.435,0.51), ylim = c(1,N_samples), 
+     main = "Total vote share for Red and Blue block for each posterior draw\n0 DtPS", 
+     ylab = "Posterior Draws", 
+     xlab = "Percentage of votes",
+     yaxt="n")
+lines(apply(sim_votes_max[1:N_samples,red_parties],1,sum)/apply(sim_votes_max[1:N_samples,c(-1)],1,sum),1:N_samples, col = "red")
+
+lines(apply(sim_votes_max[1:N_samples,blue_parties],1,sum)/apply(sim_votes_max[1:N_samples,c(-1)],1,sum),1:N_samples, col = "blue")
+lines(c(0.5,0.5),c(0, N_samples+1),lty=2)
+```
+
+

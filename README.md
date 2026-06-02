@@ -1,5 +1,6 @@
 # Spatial_26_Lydia_exam
-Repository for spatial analytics f26
+Repository for spatial analytics f26.
+
 This code should allow a full replication of my analysis
 
 ## Structure of repository
